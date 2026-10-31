@@ -1,0 +1,8 @@
+path: /home/khalil/personal_prj/海赛/data/yolo_v12
+train: train.txt
+val: val.txt
+names:
+  0: target
+  1: circle
+kpt_shape: [7, 3]
+flip_idx: [1, 0, 3, 2, 4, 6, 5]
