@@ -1,0 +1,30 @@
+# 板端调试/压测留下的临时文件，不进仓库
+视觉/.tmp/
+视觉/tmp_*.json
+
+# 板端探针脚本（一次性实验，留在本地）
+视觉/k230/_*.py
+视觉/k230/*.bak
+视觉/k230/*.bak2
+
+# 固件镜像：单个 240MB 以上，超过 GitHub 单文件 100MB 限制。
+# 需要的人按 k230/firmware/README.md 自己编或从 Release 取。
+视觉/k230/firmware/*
+!视觉/k230/firmware/README.md
+
+# 刷机前的出厂 SD 卡全量备份（厂商 kmodel / 资源，几十 MB）
+视觉/k230/sdcard_backup/
+
+# 本地一次性脚本：旧的开机入口、Windows 写卡脚本、串口上传的加速/模型变体。
+# 流程本身写在 k230/WEBRTC.md 第 2/6.4 节，不靠这些脚本。
+视觉/k230/main_webrtc.py
+视觉/k230/ybMain_main.py
+视觉/tools/*.ps1
+视觉/tools/canmv_mcp_win.py
+视觉/tools/k230_put_model.py
+视觉/tools/k230_upload_fast.py
+
+# 通用
+__pycache__/
+*.pyc
+*.orig

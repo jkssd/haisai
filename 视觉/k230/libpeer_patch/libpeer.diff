@@ -1,0 +1,196 @@
+diff --git a/3rd-party/libpeer/Makefile b/3rd-party/libpeer/Makefile
+index 11b0505..a5e6a6d 100644
+--- a/3rd-party/libpeer/Makefile
++++ b/3rd-party/libpeer/Makefile
+@@ -12,7 +12,7 @@ BUILD = $(SDK_RTSMART_BUILD_DIR)/libs/3rd-party/$(DIR)/
+ 
+ CWARN :=
+ 
+-C_CXX_FLAGS := -march=rv64imafdcv -mabi=lp64d -mcmodel=medany -Os $(CWARN) $(LIB_CFLAGS)
++C_CXX_FLAGS := -march=rv64imafdcv -mabi=lp64d -mcmodel=medany -Os $(CWARN) $(LIB_CFLAGS) -DLOG_LEVEL=2 -DLOG_REDIRECT=1 -DCONFIG_MBEDTLS_DEBUG=1
+ C_CXX_FLAGS += -I$(SDK_SRC_ROOT_DIR)/include -include "generated/autoconf.h"
+ 
+ CFLAGS := $(C_CXX_FLAGS) -std=gnu99
+diff --git a/3rd-party/libpeer/src/agent.c b/3rd-party/libpeer/src/agent.c
+index 88d0922..0c566d3 100644
+--- a/3rd-party/libpeer/src/agent.c
++++ b/3rd-party/libpeer/src/agent.c
+@@ -1198,6 +1198,17 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
+     return ret;
+   }
+ 
++  /* PROBE_MARK: log incoming packets (throttled) */
++  {
++    static int probe_recv_n = 0;
++    if (probe_recv_n < 60) {
++      char _pa[64] = {0};
++      addr_to_string(&addr, _pa, sizeof(_pa));
++      LOGI("PROBE rx #%d %d bytes from %s:%d", probe_recv_n, ret, _pa, addr.port);
++      probe_recv_n++;
++    }
++  }
++
+   /* Always try to unwrap TURN data if TURN allocation exists.
+    * Previously this only ran when agent_is_relay_active(), which meant
+    * ChannelData/Data Indication from the TURN server was silently dropped
+@@ -1343,6 +1354,11 @@ int agent_set_remote_description(Agent* agent, char* description) {
+ 
+   LOGD("remote ufrag: %s", agent->remote_ufrag);
+   LOGD("remote upwd: %s", agent->remote_upwd);
++  /* PROBE_MARK: confirm credentials actually parsed */
++  LOGI("PROBE rdesc local=%s/%s(%d) remote=%s/%s(%d) rcands=%d lcands=%d",
++       agent->local_ufrag, agent->local_upwd, (int)strlen(agent->local_upwd),
++       agent->remote_ufrag, agent->remote_upwd, (int)strlen(agent->remote_upwd),
++       remote_candidates_count, agent->local_candidates_count);
+   return 0;
+ }
+ 
+@@ -1436,10 +1452,33 @@ int agent_connectivity_check(Agent* agent) {
+     }
+   }
+ 
+-  if (!any_active) return -1;
++  /* PATCH: always service socket — answer STUN requests even when no pair
++   * is INPROGRESS any more; otherwise the agent goes deaf after all pairs
++   * fail and ICE can never recover (peer keeps sending checks, we never
++   * reply, negotiation stays in checking forever). */
++  /* PROBE_MARK: pair statistics */
++  {
++    static int probe_chk_n = 0;
++    if (probe_chk_n < 40) {
++      int _ip = 0, _succ = 0, _fail = 0;
++      for (i = 0; i < agent->active_pairs_count; i++) {
++        int st = agent->active_pairs[i]->state;
++        if (st == ICE_CANDIDATE_STATE_INPROGRESS) _ip++;
++        else if (st == ICE_CANDIDATE_STATE_SUCCEEDED) _succ++;
++        else if (st == ICE_CANDIDATE_STATE_FAILED) _fail++;
++      }
++      LOGI("PROBE chk #%d pairs=%d inprog=%d succ=%d fail=%d any_active=%d",
++           probe_chk_n, agent->active_pairs_count, _ip, _succ, _fail, any_active);
++      probe_chk_n++;
++    }
++  }
+ 
+   agent_recv(agent, buf, sizeof(buf));
+ 
++  /* PATCH2: 不要因为当前没有 INPROGRESS 的候选对就提前返回 ——
++   * 对端应答可能恰好落在两次检查之间，此时 pair 已经是 SUCCEEDED 而
++   * any_active 为 0；提前 return -1 会让连接永远停在 checking。 */
++
+   for (i = 0; i < agent->active_pairs_count; i++) {
+     if (agent->active_pairs[i]->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+       agent->selected_pair = agent->active_pairs[i];
+diff --git a/3rd-party/libpeer/src/dtls_srtp.c b/3rd-party/libpeer/src/dtls_srtp.c
+index 203241c..c144ded 100644
+--- a/3rd-party/libpeer/src/dtls_srtp.c
++++ b/3rd-party/libpeer/src/dtls_srtp.c
+@@ -451,7 +451,7 @@ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
+ 
+   ret = dtls_srtp_do_handshake(dtls_srtp);
+   if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
+-    LOGD("DTLS hello verification requested");
++    LOGI("DTLS hello verify requested");
+     mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+     mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
+     dtls_srtp->state = DTLS_SRTP_STATE_HANDSHAKE;
+diff --git a/3rd-party/libpeer/src/peer_connection.c b/3rd-party/libpeer/src/peer_connection.c
+index dc4bc12..457b958 100644
+--- a/3rd-party/libpeer/src/peer_connection.c
++++ b/3rd-party/libpeer/src/peer_connection.c
+@@ -170,6 +170,16 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t
+   /* Consume at most one datagram per tick so a busy or incomplete handshake
+    * cannot starve peers. Fragmented ClientHello messages are assembled above
+    * because Mbed TLS 3.x rejects them before its general DTLS reassembler. */
++  /* PATCH4: 每轮多消费几个数据报，避免只在每个 loop 迭代读一个包导致握手饥饿 */
++  {
++    static int _patch4_reads = 0;
++    if (_patch4_reads < 8) {
++      _patch4_reads++;
++      pc->dtls_recv_available = 1;
++    } else {
++      _patch4_reads = 0;
++    }
++  }
+   if (!pc->dtls_recv_available) {
+     return MBEDTLS_ERR_SSL_WANT_READ;
+   }
+@@ -443,6 +453,9 @@ int peer_connection_loop(PeerConnection* pc) {
+       break;
+ 
+     case PEER_CONNECTION_CHECKING:
++      /* PATCH: service socket while checking so incoming Binding Requests
++       * get answered and responses get processed promptly. */
++      agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf));
+       if (agent_select_candidate_pair(&pc->agent) < 0) {
+         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+       } else if (agent_connectivity_check(&pc->agent) == 0) {
+@@ -685,7 +698,9 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
+ 
+   switch (sdp_type) {
+     case SDP_TYPE_OFFER:
+-      role = DTLS_SRTP_ROLE_SERVER;
++      /* PATCH5: 板子作为 DTLS client（setup:active），避开 server 端 hello-verify
++       * cookie 校验反复失败的问题。 */
++      role = DTLS_SRTP_ROLE_CLIENT;
+       if (pc->agent.turn_relay_ready || pc->agent.turn_server_addr.family != 0) {
+         LOGI("New offer: releasing previous TURN allocation before re-gathering candidates");
+         agent_turn_deallocate(&pc->agent);
+diff --git a/3rd-party/libpeer/src/utils.h b/3rd-party/libpeer/src/utils.h
+index 1caf11d..e5e5ff8 100644
+--- a/3rd-party/libpeer/src/utils.h
++++ b/3rd-party/libpeer/src/utils.h
+@@ -25,8 +25,11 @@ void peer_log(char* level_tag, const char* file_name, int line_number, const cha
+ #define LOG_PRINT(level_tag, fmt, ...) \
+   peer_log(level_tag, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
+ #else
++/* RT-Smart: bare printf/fprintf(stdout) does not reach the serial console.
++ * Route through rt_kprintf (declared here to avoid pulling in rtthread.h). */
++int rt_kprintf(const char *fmt, ...);
+ #define LOG_PRINT(level_tag, fmt, ...) \
+-  fprintf(stdout, "%s\t%s\t%d\t" fmt "\n", level_tag, __FILE__, __LINE__, ##__VA_ARGS__)
++  rt_kprintf("%s\t%s\t%d\t" fmt "\n", level_tag, __FILE__, __LINE__, ##__VA_ARGS__)
+ #endif
+ 
+ #if LOG_LEVEL >= LEVEL_DEBUG
+diff --git a/3rd-party/mbedtls/port/mbedtls_port_config.h b/3rd-party/mbedtls/port/mbedtls_port_config.h
+index 3079fae..d84d67b 100644
+--- a/3rd-party/mbedtls/port/mbedtls_port_config.h
++++ b/3rd-party/mbedtls/port/mbedtls_port_config.h
+@@ -4374,3 +4374,4 @@ int mbedtls_platform_snprintf(char *s, size_t n, const char *fmt, ...);
+ #include "mbedtls/platform_time.h"
+ 
+ extern mbedtls_time_t mbedtls_time_wrap(mbedtls_time_t* timer);
++
+diff --git a/port/modules/modwebrtc.c b/port/modules/modwebrtc.c
+index 6174081..4ea774b 100644
+--- a/port/modules/modwebrtc.c
++++ b/port/modules/modwebrtc.c
+@@ -27,6 +27,19 @@
+ 
+ #include "peer.h"
+ 
++#include <stdarg.h>
++
++/* libpeer 的 fprintf(stdout) 在 RT-Smart 下到不了串口，统一走 MicroPython 控制台。 */
++void peer_log(char* level_tag, const char* file_name, int line_number,
++              const char* fmt, ...) {
++    char buf[280];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    mp_printf(&mp_plat_print, "[%s] %s:%d %s\n", level_tag, file_name, line_number, buf);
++}
++
+ typedef struct {
+     mp_obj_base_t base;
+     pthread_mutex_t mutex;
+diff --git a/3rd-party/mbedtls/port/mbedtls_port_config.h b/3rd-party/mbedtls/port/mbedtls_port_config.h
+index 3079fae..d84d67b 100644
+--- a/3rd-party/mbedtls/port/mbedtls_port_config.h
++++ b/3rd-party/mbedtls/port/mbedtls_port_config.h
+@@ -4374,3 +4374,4 @@ int mbedtls_platform_snprintf(char *s, size_t n, const char *fmt, ...);
+ #include "mbedtls/platform_time.h"
+ 
+ extern mbedtls_time_t mbedtls_time_wrap(mbedtls_time_t* timer);
++
