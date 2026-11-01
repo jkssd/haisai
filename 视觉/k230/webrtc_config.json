@@ -22,7 +22,7 @@
   "feed_all": false,
   "fps": 30,
   "gop": 20,
-  "detect_every": 8,
+  "detect_every": 2,
   "port": 8080,
   "token": ""
 }

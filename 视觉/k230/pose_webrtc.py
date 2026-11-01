@@ -51,8 +51,37 @@ MAX_CAND = 40
 MAX_DET = 12
 MIN_HITS, MAX_MISSES = 3, 2
 CIRCLE_W = 0.8
+# AI 各阶段累计（纳秒），每统计周期清零；n = 跑了多少次
+AI_T = {"ai2d": 0, "kpu": 0, "numpy": 0, "nms": 0, "n": 0}
 BIT_RATE = int(CFG.get("bit_rate") or 1000)
-DETECT_EVERY = int(CFG.get("detect_every") or 2)
+
+# 识别框刷新间隔（越大 = AI 越稀 = 帧率越高，但图形越顿）。
+# 板上实测：kpu 单次 34~36ms，其它每轮约 16ms。每 N 轮平均 ≈ 16 + 36/N：
+#   N=1 -> 52ms(19fps)  识别框 19Hz
+#   N=2 -> 34ms(29fps)  识别框 14Hz   <-- 当前
+#   N=3 -> 28ms(35fps)  识别框 11Hz
+# 取 2：识别框刷新更快（14Hz），帧率仍接近 30fps，
+# 而且喂帧率 29 < 编码器声明的 30fps，码率不会超配（约 1300 kbit/s）。
+# 想要极限帧率就改 3；想更跟手就改 1（帧率会掉到 ~19fps）。
+MAX_DETECT_EVERY = 2
+
+
+def _clamp_detect(n):
+    n = int(n)
+    if n < 1:
+        n = 1
+    elif n > MAX_DETECT_EVERY:
+        n = MAX_DETECT_EVERY
+    return n
+
+
+DETECT_EVERY = _clamp_detect(CFG.get("detect_every") or 2)
+
+# 主循环末尾要不要「补齐到固定帧间隔」。
+# 老代码固定补到 gap_for(fps)=33ms，本意是让节奏均匀；
+# 但实测非 AI 的那几轮只干 19ms 的活，却被硬睡 14ms —— 白扔 1/4 的 CPU。
+# 现在默认 0（不补），让循环跑满；真要均匀节奏可以设成 33 之类。
+LOOP_PAD_MS = int(CFG.get("loop_pad_ms") or 0)
 GOP = int(CFG.get("gop") or 30)
 # 码率硬上限。CBR 在复杂场景会超发，2.4G 上一超发就拥塞丢包 -> 花屏。
 # 0 = 不限制（保持老行为）。
@@ -68,7 +97,10 @@ BIT_RATE_MAX = int(CFG.get("bit_rate_max") or 0)
 #   20 -> 屏幕约 24fps（低于 loop 周期，保证每轮都刷；实测 show 只要 ~2.7ms，不影响推流）
 # 关键：阈值必须明显小于主循环周期（约 40ms），否则会和循环周期"共振"——
 # 时间是「每轮累加一次」，阈值贴着周期时，抖动会让它隔一轮才触发一次，帧率直接腰斩。
-TFT_SHOW_MS = int(CFG.get("tft_show_ms") or 20)
+#   0  -> 每轮都刷（推荐：屏幕帧率 == 主循环帧率，跟手且不会忽快忽慢）
+#   20 -> 实测会被循环周期"量化"成隔轮刷一次，屏幕反而只剩一半帧率
+# 结论：这里必须用 0，让刷屏节流完全交给循环本身。
+TFT_SHOW_MS = int(CFG.get("tft_show_ms") or 0)
 
 # --- 自适应码率（STA 模式读 RSSI 做闭环） ---
 ADAPTIVE = bool(CFG.get("adaptive", True))
@@ -144,10 +176,14 @@ def gap_for(fps):
 
 def detect(kpu, ai2d, arr):
     """跑一次推理，返回 (keep, o)。keep = [(score, box, anchor, cls), ...]。"""
+    t_a0 = time.time_ns()
     ten = ai2d.run(arr)
+    t_a1 = time.time_ns()
     kpu.set_input_tensor(0, ten)
     kpu.run()
+    t_a2 = time.time_ns()
     o = kpu.get_output_tensor(0).to_numpy()[0]
+    t_a3 = time.time_ns()
 
     smax = np.maximum(o[4], o[5])
     keep = []
@@ -179,6 +215,12 @@ def detect(kpu, ai2d, arr):
         keep.append((b0, box, i, cls))
         if len(keep) >= MAX_DET:
             break
+    # 分阶段计时：定位「AI 慢」到底慢在缩放、KPU 还是后处理
+    AI_T["ai2d"] += t_a1 - t_a0
+    AI_T["kpu"] += t_a2 - t_a1
+    AI_T["numpy"] += t_a3 - t_a2
+    AI_T["nms"] += time.time_ns() - t_a3
+    AI_T["n"] += 1
     return keep, o
 
 
@@ -276,7 +318,13 @@ def run():
     # 喂帧节流：编码器每收到一帧就编一帧，主循环跑多快它就编多快，
     # 只有主动控制送帧节奏才能真正限制帧率（否则码率被摊薄、画质变差）。
     frame_gap_ms = gap_for(cur_fps_cap)
-    feed_gap_ms = max(1, frame_gap_ms - 3) if frame_gap_ms else 0
+    # 送帧节流：原本是 frame_gap-3（约 30ms）。但主循环周期约 29ms，
+    # 30ms 的门槛会让它「隔一轮才送一次」—— 实测循环能跑 34 次/秒，
+    # 实际只喂出去 22 帧，白白丢掉三分之一。
+    # 设 0 = 每轮都送，喂帧率就等于循环率（约 34fps），
+    # 代价是编码器按 30fps 的每帧预算发 34 帧，码率会高约 13%
+    # （1400 -> 约 1580 kbit/s；链路弱时自适应会降到 LOW_RATE，不影响）。
+    feed_gap_ms = 0
     # feed_all=True：不做软件节流，每一轮都喂给编码器。
     # 【实测结论：别开】VENC 的 dst_frame_rate 只在「声明的输入帧率」上参与码率分配，
     # **不会真的丢帧**：喂 45.7 帧/秒它就编 45.7 帧/秒，码率冲到 1900 kbit/s，
@@ -286,6 +334,7 @@ def run():
         feed_gap_ms = 0
     last_feed_ms = 0
     last_show_ms = 0
+    t_reap = time.ticks_ms()
 
     # RGB565 -> YUV420SP，把画好框的帧转给编码器，这样推流画面带识别框
     csc = CSC(CSC.PIXEL_FORMAT_YUV_SEMIPLANAR_420, max_width=W, max_height=H, buf_num=6)
@@ -383,6 +432,7 @@ def run():
     pending_feed = False   # 上一轮喂过帧、还没取流
     gated = 0
     n_show = 0             # 这一统计周期里 TFT 真的刷了几次（= 屏幕实际帧率）
+    n_loop = 0             # 主循环跑了多少轮（区分「循环慢」和「喂帧少」）
     gate = 0
     low_streak = 0
     high_streak = 0
@@ -398,6 +448,7 @@ def run():
         while True:
             os.exitpoint()
             hb["t"] = time.ticks_ms()
+            n_loop += 1
             if wdt is not None:
                 try:
                     wdt.feed()
@@ -405,6 +456,13 @@ def run():
                     pass
             if server.stopping:
                 raise RuntimeError("signaling stopped")
+            # 定期回收僵尸会话：客户端异常消失后 ICE 会一直停在 COMPLETED，
+            # is_connected() 仍为 True，但发送缓冲永远排不空 ——
+            # peer.send_video 就会阻塞近 1 秒，把主循环整个卡住，
+            # 外部看到的就是「码率/帧率突然掉到 0」。reap_safe 拿不到锁直接跳过。
+            if time.ticks_diff(time.ticks_ms(), t_reap) >= ws.PEER_REAP_EVERY_MS:
+                t_reap = time.ticks_ms()
+                server.reap_safe()
             if server.reboot_at is not None and \
                     time.ticks_diff(time.ticks_ms(), server.reboot_at) >= 0:
                 print("OTA: 收到 /reboot，复位板子")
@@ -684,8 +742,8 @@ def run():
                     cur_rate = _p["rate"]
                     cur_fps_cap = _p["fps"]
                     frame_gap_ms = gap_for(cur_fps_cap)
-                    feed_gap_ms = max(1, frame_gap_ms - 3) if frame_gap_ms else 0
-                    DETECT_EVERY = _p["detect"]
+                    feed_gap_ms = 0        # 同主初始化：每轮都喂，别被量化掉一半
+                    DETECT_EVERY = _clamp_detect(_p["detect"])
                     server.current_profile = _pf
                     server.current_rate = cur_rate
                     enc = swap_encoder(enc, cur_rate, cur_fps_cap)
@@ -741,9 +799,21 @@ def run():
                        cur_rssi, cur_rate,
                        T_SNAP, T_IMG, T_AI, gated, T_DRAW, T_CSC, T_FEED, T_SHOW,
                        T_GET, T_SEND))
+                # AI 拆解：定位到底哪一段慢（缩放 / KPU / 取输出 / 后处理）
+                _an = max(1, AI_T["n"])
+                _a2d = AI_T["ai2d"] / _an / 1e6
+                _kpu = AI_T["kpu"] / _an / 1e6
+                _npy = AI_T["numpy"] / _an / 1e6
+                _nms = AI_T["nms"] / _an / 1e6
+                _hz = AI_T["n"] / dt
+                print("   AI 拆解 ai2d=%.1f kpu=%.1f to_numpy=%.1f nms=%.1f ms  频次=%.1f Hz  循环=%.1f/s"
+                      % (_a2d, _kpu, _npy, _nms, _hz, n_loop / dt))
+                AI_T["ai2d"] = AI_T["kpu"] = AI_T["numpy"] = AI_T["nms"] = 0
+                AI_T["n"] = 0
+                n_loop = 0
                 # 给 /status 用：不接串口也能远程读这些数
                 server.stats = {
-                    "fps": cur_fps, "tft_fps": n_show / dt,
+                    "fps": cur_fps, "tft_fps": n_show / dt, "ai_hz": _hz,
                     "kbps": sent_bytes * 8 / dt / 1000.0,
                     "sess": server.session_states(),
                     "detail": "snap=%d img=%d ai=%d/%d csc=%d feed=%d get=%d send=%d show=%d H%d I%d" %
@@ -760,12 +830,9 @@ def run():
                 n_hdr = 0
                 n_i = 0
 
-            # 帧节奏：把这一轮补齐到目标帧间隔。
-            # 摄像头给 60fps，主循环干完活只要 ~21ms；不补的话「送帧节流」
-            # 会落到「每隔一轮送一次」（24fps）。补到 33ms 之后每轮都送，
-            # 稳定 30fps，而且 AI/显示/编码的节奏也均匀，不再忽快忽慢。
-            if frame_gap_ms > 0:
-                _left = frame_gap_ms - time.ticks_diff(time.ticks_ms(), _t_loop)
+            # 帧节奏：LOOP_PAD_MS>0 才补齐到固定间隔（默认 0 = 不补，跑满 CPU）
+            if LOOP_PAD_MS > 0:
+                _left = LOOP_PAD_MS - time.ticks_diff(time.ticks_ms(), _t_loop)
                 if _left > 0:
                     time.sleep_ms(_left)
     except KeyboardInterrupt:

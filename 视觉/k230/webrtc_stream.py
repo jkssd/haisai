@@ -77,6 +77,23 @@ HTTP_MAX_HEADER_BYTES = 16384
 HTTP_MAX_BODY_BYTES = 65536
 STATS_EVERY_MS = 1000
 
+# --- 推流「突然掉到 0」的防护 ---
+# 病因（板上实测）：客户端异常消失后 ICE 仍停在 COMPLETED，
+# peer.is_connected() 一直为 True，但它的发送缓冲永远排不空，
+# 于是 peer.send_video() 阻塞约 1 秒（日志里 get≈send≈966ms），
+# 主循环被整个卡住 -> 接收端码率/帧率瞬间归零，然后自己恢复。
+# 对策：单次发送超过 SLOW 就把该会话记为「卡住」，连续 STRIKES 次就隔离
+# （隔离期内不发，每 PROBE 探一次活），彻底不再阻塞主循环；
+# 超过 IDLE_DROP 都没有一次成功发送，就判定是僵尸会话直接踢掉。
+PEER_SEND_SLOW_MS = 250       # 单次 send_video 超过这个时长才算「病态」
+                              # （正常 2~5ms，抖动顶多几十 ms；真正的阻塞是 ~966ms，
+                              #   阈值设 80 会把普通抖动误判成僵死，反而制造卡顿）
+PEER_SEND_STRIKES = 1         # 出现一次病态阻塞就立刻隔离，不再让它拖第二下
+PEER_QUARANTINE_MS = 1000     # 隔离时长（隔离期内不发帧，避免继续阻塞主循环）
+PEER_PROBE_MS = 500           # 隔离期间探活间隔：一探成功就立刻恢复
+PEER_IDLE_DROP_MS = 20000     # 这么久没成功发送过就踢掉（僵尸会话）
+PEER_REAP_EVERY_MS = 2000     # 主循环里多久跑一次 reap
+
 
 def load_config():
     cfg = dict(DEFAULTS)
@@ -577,7 +594,13 @@ class SignalingServer:
         return out
 
     def drop(self, session_id):
-        self.sessions.pop(session_id)["peer"].close()
+        session = self.sessions.pop(session_id, None)
+        if session is None:
+            return
+        try:
+            session["peer"].close()
+        except Exception:
+            pass
 
     def close_client(self, client):
         try:
@@ -654,6 +677,30 @@ class SignalingServer:
             elif state != webrtc.STATE_COMPLETED and time.ticks_diff(now, session["activity"]) > NEGOTIATION_TIMEOUT_MS:
                 _slog("REAP %s state=%s (negotiation timeout)" % (session_id[:8], _state_name(session["peer"])))
                 self.drop(session_id)
+            else:
+                # 老代码只按 state 判断，COMPLETED 的会话永远不回收。
+                # 但客户端异常消失（关页面/掉 WiFi/手机休眠）时 ICE 会长期停在
+                # COMPLETED，is_connected() 仍是 True，发送缓冲排不空 -> 堵死主循环。
+                # 这里用「最近一次成功发送」当心跳，太久没成功就认定是僵尸会话。
+                last_ok = session.get("last_ok")
+                if last_ok is None:
+                    last_ok = session.get("activity", now)
+                if time.ticks_diff(now, last_ok) > PEER_IDLE_DROP_MS:
+                    _slog("REAP %s state=%s (僵尸会话：%d ms 没有发送成功)"
+                          % (session_id[:8], _state_name(session["peer"]),
+                             time.ticks_diff(now, last_ok)))
+                    self.drop(session_id)
+
+    def reap_safe(self):
+        """主循环用：拿不到锁就直接跳过，绝不阻塞画面。"""
+        if not self.lock.acquire(False):
+            return
+        try:
+            self.reap()
+        except Exception:
+            pass
+        finally:
+            self.lock.release()
 
     def handle(self, method, path, body, client_ip, local_ip):
         route, params = parse_request_target(path)
@@ -737,6 +784,18 @@ class SignalingServer:
                 self.reap()
                 if len(self.sessions) >= MAX_CLIENTS:
                     return "503 Service Unavailable", "text/plain", b"too many clients", None
+                # 同一个客户端重新打开页面时，它上一次的会话（COMPLETED 僵尸）
+                # 会一直占着发送缓冲。新 offer 进来就把它踢掉，避免越积越多
+                # 到最后每个会话都堵一下主循环。只动同一个 client_ip 且已经
+                # 停止发送超过 3 秒的会话，不影响正常的多设备同时观看。
+                _tnow = time.ticks_ms()
+                for _sid, _s in list(self.sessions.items()):
+                    if _s.get("client") != client_ip:
+                        continue
+                    _ok = _s.get("last_ok") or _s.get("activity", _tnow)
+                    if time.ticks_diff(_tnow, _ok) > 3000:
+                        _slog("REAP %s（同 IP 旧会话，新 offer 顶掉）" % _sid[:8])
+                        self.drop(_sid)
                 session_id = random_hex()
                 while session_id in self.sessions:
                     session_id = random_hex()
@@ -749,7 +808,8 @@ class SignalingServer:
                 offer = offer_sdp.encode()
                 with self.lock:
                     self.sessions[session_id] = {"peer": peer, "client": client_ip,
-                        "local": local_ip, "activity": time.ticks_ms(), "ready": False}
+                        "local": local_ip, "activity": time.ticks_ms(), "ready": False,
+                        "last_ok": time.ticks_ms(), "strikes": 0, "stalled_until": 0}
             except BaseException:
                 peer.close()
                 raise
@@ -882,11 +942,45 @@ class SignalingServer:
         if not got:
             return False
         try:
+            now = time.ticks_ms()
             sent = False
-            for session in self.sessions.values():
-                if session["peer"].is_connected():
-                    session["peer"].send_video(data, timestamp)
-                    sent = True
+            for session_id, session in list(self.sessions.items()):
+                peer = session["peer"]
+                try:
+                    if not peer.is_connected():
+                        continue
+                except Exception:
+                    continue
+                # 隔离期：跳过这个会话，只按 PROBE 间隔试一次，避免再次长时间阻塞
+                until = session.get("stalled_until", 0)
+                if until and time.ticks_diff(until, now) > 0:
+                    if time.ticks_diff(now, session.get("probe_at", 0)) < 0:
+                        continue
+                session["probe_at"] = time.ticks_add(now, PEER_PROBE_MS)
+                t_send = time.ticks_ms()
+                try:
+                    peer.send_video(data, timestamp)
+                except Exception:
+                    _slog("SEND ERR %s -> 踢掉" % session_id[:8])
+                    self.drop(session_id)
+                    continue
+                cost = time.ticks_diff(time.ticks_ms(), t_send)
+                if cost <= PEER_SEND_SLOW_MS:
+                    # 正常：清掉卡顿计数；如果之前在隔离，说明链路恢复了，要补一个 IDR
+                    if session.get("stalled_until"):
+                        session["ready"] = False
+                        _slog("RECOVER %s cost=%dms -> 请求 IDR" % (session_id[:8], cost))
+                    session["stalled_until"] = 0
+                    session["strikes"] = 0
+                    session["last_ok"] = time.ticks_ms()
+                else:
+                    session["strikes"] = session.get("strikes", 0) + 1
+                    if session["strikes"] >= PEER_SEND_STRIKES:
+                        session["stalled_until"] = time.ticks_add(
+                            time.ticks_ms(), PEER_QUARANTINE_MS)
+                        _slog("ISOLATE %s cost=%dms strikes=%d（暂停给该会话发帧）"
+                              % (session_id[:8], cost, session["strikes"]))
+                sent = True
             return sent
         finally:
             self.lock.release()
