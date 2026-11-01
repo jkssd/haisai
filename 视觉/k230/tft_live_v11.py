@@ -31,13 +31,25 @@ MAX_CAND = 40        # 先多取候选再按类 NMS：一块板会有几十个�
 MAX_DET = 12         # 只取 6 个的话圆永远排不进去（这就是之前"只有框没有圆"的原因）
 MIN_HITS, MAX_MISSES = 3, 2
 DBG_EVERY = 120      # 仅用于调试打点，不再用它退出循环
+DBG_SAVE = False     # True = 每 60 帧往 /sdcard 存一张调试图（会卡！平时必须 False）
 TO_IDE = False
-# 推理节流：TFT 看不出 22fps 与 25fps 的差别，但每帧都推理会把 ST7701 的 SPI 刷屏
-# 挤掉、还拖慢整轮循环。每 2 帧跑一次 AI、其余帧复用上一轮确认的 pts 重画，
-# 是 pose_webrtc.py 实测既稳又跟手的做法。想更跟手把 DETECT_EVERY 设 1。
-DETECT_EVERY = 2
-SHOW_GAP_MS = 66     # TFT 刷屏节流：ST7701 一次 640x480 RGB565 传输约 30ms，每轮都刷会卡
-                      # 推理；限到 ~15fps 刷新足够看，把 CPU 让给取帧与检测。
+# 板上实测（640x480 RGB565 + 448 int8）：snap≈13ms, ai≈38ms, draw≈1ms, show≈1ms。
+# 也就是说 **TFT 刷屏根本不是瓶颈**（show_image 是异步的，只花 ~1ms），
+# 真正吃时间的是 KPU 推理的 38ms——它比"一帧的预算"还长 2.5 倍。
+# 所以「卡」的根因是：①显示被节流成 15fps；②每帧/隔帧都推理，让帧间隔忽 15ms 忽 52ms。
+#
+# 对策：把推理摊薄。每 DETECT_EVERY 帧才推理一次，其余帧只取帧+重画（~15ms），
+# 帧间隔就稳定接近摄像头节拍，视频流畅；检测框每 DETECT_EVERY 帧刷新一次。
+# 静止靶子场景 DETECT_EVERY=4 时约 40fps、检测 ~10Hz，肉眼已经不再"一卡一卡"。
+# 调参口径（实测）：
+#   1 → 每帧推理，~19fps（最灵敏但最卡）
+#   2 → ~29fps（检测 ~15Hz）
+#   4 → ~40fps（检测 ~10Hz，推荐）
+#   6 → ~46fps（检测 ~7Hz，摄像头 60fps 封顶，画面最顺）
+DETECT_EVERY = 4
+SHOW_GAP_MS = 0      # 0 = 每轮都刷。实测 show_image 只花 ~1ms（异步），
+                      # 之前设 66 把显示限到 15fps，才是「一卡一卡」的真正原因。
+                      # 除非以后换了同步刷屏的驱动，否则保持 0。
 
 
 def iou(a, b):
@@ -147,7 +159,10 @@ def main():
     gate = 0             # 推理节流计数器：每 DETECT_EVERY 帧跑一次 AI
     keep = []            # 最近一次推理留下的候选（非检测帧复用其 pts 重画）
     o = None
-    last_show_ms = 0     # TFT 刷屏节流时间戳
+    # 分阶段计时（和 pose_webrtc 的排查口径一致，方便对比到底哪一步吃时间）
+    T_SNAP = T_AI = T_DRAW = T_SHOW = 0
+    ai_runs = 0          # 这 30 帧里 AI 真跑了几次（判断节流是否生效）
+    ran_ai = False       # 本帧是否跑了 AI（MicroPython 的 dir() 不可靠，用显式标志）
     print("LOOP start")
 
     try:
@@ -157,6 +172,7 @@ def main():
             arr = sen.snapshot(chn=CAM_CHN_ID_2).to_numpy_ref()
             t1 = time.time_ns()
             gate += 1
+            ran_ai = False
             # 推理节流：每 DETECT_EVERY 帧跑一次 KPU，其余帧跳过 AI、直接复用上一帧结果重画。
             # 跳过 AI 的那一轮整轮只要 ~8ms（取帧+画框），TFT 刷新立刻跟手、不再卡。
             if gate % DETECT_EVERY == 1 or o is None:
@@ -166,6 +182,8 @@ def main():
                 kpu.run()
                 o = kpu.get_output_tensor(0).to_numpy()[0]
                 t2 = time.time_ns()
+                ran_ai = True
+                ai_runs += 1
 
                 # 每个 anchor 取两类里分数高的那个；top-k 用 ulab 向量化，避免逐点 Python 循环
                 smax = np.maximum(o[4], o[5])
@@ -409,33 +427,70 @@ def main():
                       % (len(confirmed), n_conf, n_cand,
                          [round(float(x), 3) for x in ratios]))
 
-            # TFT 刷屏节流：ST7701 一次 640x480 RGB565 传输约 30ms，每轮都刷会挤掉取帧/推理、
-            # 让屏幕卡。限到 ~15fps 刷新足够看，把时间让给采集与检测。
-            _now = time.ticks_ms()
-            if time.ticks_diff(_now, last_show_ms) >= SHOW_GAP_MS:
-                try:
-                    Display.show_image(img)
-                    last_show_ms = _now
-                except Exception as e:
-                    if n < 3:
-                        print("show_image err:", type(e).__name__, e)
+            # TFT 每轮都刷（SHOW_GAP_MS=0）：显示稳定 ~22-30fps 才不卡。
+            t_draw = time.time_ns()
+            try:
+                Display.show_image(img)
+            except Exception as e:
+                if n < 3:
+                    print("show_image err:", type(e).__name__, e)
             t3 = time.time_ns()
+
+            # 分阶段累计（n 到 30 一起打印 + 清零，口径与 pose_webrtc 一致）
+            T_SNAP += (t1 - t0)
+            if ran_ai:
+                T_AI += (t2 - t1)
+                T_DRAW += (t_draw - t2)
+            else:
+                T_DRAW += (t_draw - t1)
+            T_SHOW += (t3 - t_draw)
+
             n += 1
             t_sum += (t3 - t0)
-            if "t2" in dir() and t2 is not None:   # 只有检测帧才累加了 t2
+            if ran_ai:
                 t_inf += (t2 - t1)
-            if n % 60 == 0:
+            # 注意：不要在这里周期性存 JPEG！img.compress+save 每 60 帧来一次
+            # 会插入 30~100ms 的卡顿（JPEG 编码 + TF 卡写入），肉眼就是一个周期性的顿。
+            # 需要留图排查时把 DBG_SAVE 改 True，平时必须关着。
+            if DBG_SAVE and n % 60 == 0:
                 try:
                     img.compress(quality=85).save("/sdcard/_v11_dbg.jpg")
                 except Exception as e:
                     print("dbg save err", e)
-            if n % 30 == 0:
-                print("fps=%.1f inf=%.1fms conf=%d cand=%d"
-                      % (30 * 1e9 / max(1, t_sum), t_inf / 30.0 / 1e6, n_conf, n_cand))
+            # 统计打印每 60 帧一次（~2s）：115200 串口打一行约 9ms，
+            # 每 30 帧打一次也是个小周期性抖动的来源。
+            if n % 60 == 0:
+                # fps = 真实循环率 = 真实显示率（每轮都 show，没被节流）
+                print("fps=%.1f snap=%.1f ai=%.1f(/%d) draw=%.1f show=%.1f ms conf=%d cand=%d"
+                      % (60 * 1e9 / max(1, t_sum),
+                         T_SNAP / 60.0 / 1e6,
+                         T_AI / max(1, ai_runs) / 1e6, ai_runs,
+                         T_DRAW / 60.0 / 1e6,
+                         T_SHOW / 60.0 / 1e6,
+                         n_conf, n_cand))
                 t_sum = 0
                 t_inf = 0
+                T_SNAP = T_AI = T_DRAW = T_SHOW = 0
+                ai_runs = 0
     except KeyboardInterrupt:
         pass
+    finally:
+        # 必须释放 sensor/display/media，否则下一次运行会报
+        # "sensor(2) is already inited"（之前就是这个坑）
+        print("正在关闭…")
+        try:
+            sen.stop()
+        except Exception:
+            pass
+        try:
+            Display.deinit()
+        except Exception:
+            pass
+        try:
+            MediaManager.deinit()
+        except Exception:
+            pass
+        print("已停止")
     print("LOOP end n=%d" % n)
 
 
