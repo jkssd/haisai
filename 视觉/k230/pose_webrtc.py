@@ -58,6 +58,18 @@ GOP = int(CFG.get("gop") or 30)
 # 0 = 不限制（保持老行为）。
 BIT_RATE_MAX = int(CFG.get("bit_rate_max") or 0)
 
+# TFT 屏幕刷新间隔（ms）。这里是「显示」节流，和推理、编码都无关。
+# 老代码写死 80ms（= 12.5fps），所以串口打印 fps=22 而屏幕只有 12.5fps，
+# 看着就是一卡一卡——这就是「帧率和实际不符」的来源。
+# 板上实测：本脚本里 Display.show_image 要 ~26ms（和 VENC/CSC 抢显示缓冲，
+# 比纯 TFT 脚本里的 ~1ms 慢一个量级），所以不能设得太小，否则会挤掉编码时间。
+#   80 -> 屏幕约 11fps（老代码的写死值，肉眼明显卡）
+#   40 -> 屏幕约 14fps（刚好等于 loop 周期，抖动一大就隔轮刷，等于没改）
+#   20 -> 屏幕约 24fps（低于 loop 周期，保证每轮都刷；实测 show 只要 ~2.7ms，不影响推流）
+# 关键：阈值必须明显小于主循环周期（约 40ms），否则会和循环周期"共振"——
+# 时间是「每轮累加一次」，阈值贴着周期时，抖动会让它隔一轮才触发一次，帧率直接腰斩。
+TFT_SHOW_MS = int(CFG.get("tft_show_ms") or 20)
+
 # --- 自适应码率（STA 模式读 RSSI 做闭环） ---
 ADAPTIVE = bool(CFG.get("adaptive", True))
 LOW_RATE = int(CFG.get("bit_rate_low") or max(300, BIT_RATE // 4))
@@ -370,6 +382,7 @@ def run():
     T_IMG = T_FEED = T_SEND = 0
     pending_feed = False   # 上一轮喂过帧、还没取流
     gated = 0
+    n_show = 0             # 这一统计周期里 TFT 真的刷了几次（= 屏幕实际帧率）
     gate = 0
     low_streak = 0
     high_streak = 0
@@ -634,12 +647,14 @@ def run():
 
             T_CSC += time.ticks_diff(time.ticks_ms(), _t3)
             _t4 = time.ticks_ms()
-            # 屏幕刷新比编码慢一档（13fps 足够看），把 CPU 让给编码和推流
+            # 屏幕刷新：间隔由 TFT_SHOW_MS 控制（默认 55ms≈18fps）。
+            # 别再写死 80ms —— 那是 12.5fps，肉眼明显一卡一卡。
             _now_s = time.ticks_ms()
-            if time.ticks_diff(_now_s, last_show_ms) >= 80:
+            if time.ticks_diff(_now_s, last_show_ms) >= TFT_SHOW_MS:
                 last_show_ms = _now_s
                 try:
                     Display.show_image(img)
+                    n_show += 1
                 except Exception:
                     pass
 
@@ -718,17 +733,18 @@ def run():
                 dt = time.ticks_diff(now, t_stat) / 1000.0
                 cur_fps = frames / dt
                 hb["fps"] = cur_fps
-                print("统计 fps=%.1f 发送=%.0f 目标=%d 会话=%d 状态=%s H=%d I=%d rssi=%s/%d"
+                print("统计 fps=%.1f 屏幕fps=%.1f 发送=%.0f 目标=%d 会话=%d 状态=%s H=%d I=%d rssi=%s/%d"
                       " | snap=%d img=%d ai=%d(/%d) draw=%d csc=%d feed=%d show=%d"
                       " get=%d send=%d ms" %
-                      (cur_fps, sent_bytes * 8 / dt / 1000.0, n_conf_total,
+                      (cur_fps, n_show / dt, sent_bytes * 8 / dt / 1000.0, n_conf_total,
                        server.connected_count(), server.session_states(), n_hdr, n_i,
                        cur_rssi, cur_rate,
                        T_SNAP, T_IMG, T_AI, gated, T_DRAW, T_CSC, T_FEED, T_SHOW,
                        T_GET, T_SEND))
                 # 给 /status 用：不接串口也能远程读这些数
                 server.stats = {
-                    "fps": cur_fps, "kbps": sent_bytes * 8 / dt / 1000.0,
+                    "fps": cur_fps, "tft_fps": n_show / dt,
+                    "kbps": sent_bytes * 8 / dt / 1000.0,
                     "sess": server.session_states(),
                     "detail": "snap=%d img=%d ai=%d/%d csc=%d feed=%d get=%d send=%d show=%d H%d I%d" %
                               (T_SNAP, T_IMG, T_AI, gated, T_CSC, T_FEED, T_GET, T_SEND,
@@ -737,6 +753,7 @@ def run():
                 T_SNAP = T_AI = T_DRAW = T_CSC = T_SHOW = T_GET = 0
                 T_IMG = T_FEED = T_SEND = 0
                 gated = 0
+                n_show = 0
                 t_stat = now
                 sent_bytes = 0
                 frames = 0
