@@ -427,7 +427,7 @@ def main():
                       % (len(confirmed), n_conf, n_cand,
                          [round(float(x), 3) for x in ratios]))
 
-            # TFT 每轮都刷（SHOW_GAP_MS=0）：显示稳定 ~22-30fps 才不卡。
+            # TFT 每轮都刷（SHOW_GAP_MS=0）：实测 show_image 只花 ~1ms，稳定 ~38fps。
             t_draw = time.time_ns()
             try:
                 Display.show_image(img)
@@ -436,7 +436,7 @@ def main():
                     print("show_image err:", type(e).__name__, e)
             t3 = time.time_ns()
 
-            # 分阶段累计（n 到 30 一起打印 + 清零，口径与 pose_webrtc 一致）
+            # 分阶段累计（每 60 帧一起打印 + 清零，口径与 pose_webrtc 一致）
             T_SNAP += (t1 - t0)
             if ran_ai:
                 T_AI += (t2 - t1)
