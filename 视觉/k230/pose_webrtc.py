@@ -55,27 +55,16 @@ CIRCLE_W = 0.8
 AI_T = {"ai2d": 0, "kpu": 0, "numpy": 0, "nms": 0, "n": 0}
 BIT_RATE = int(CFG.get("bit_rate") or 1000)
 
-# 识别框刷新间隔（越大 = AI 越稀 = 帧率越高，但图形越顿）。
-# 板上实测：kpu 单次 34~36ms，其它每轮约 16ms。每 N 轮平均 ≈ 16 + 36/N：
-#   N=1 -> 52ms(19fps)  识别框 19Hz
-#   N=2 -> 34ms(29fps)  识别框 14Hz   <-- 当前
-#   N=3 -> 28ms(35fps)  识别框 11Hz
-# 取 2：识别框刷新更快（14Hz），帧率仍接近 30fps，
-# 而且喂帧率 29 < 编码器声明的 30fps，码率不会超配（约 1300 kbit/s）。
-# 想要极限帧率就改 3；想更跟手就改 1（帧率会掉到 ~19fps）。
-MAX_DETECT_EVERY = 2
-
-
-def _clamp_detect(n):
-    n = int(n)
-    if n < 1:
-        n = 1
-    elif n > MAX_DETECT_EVERY:
-        n = MAX_DETECT_EVERY
-    return n
-
-
-DETECT_EVERY = _clamp_detect(CFG.get("detect_every") or 2)
+# 识别框刷新频率（Hz）。用「时间节拍」控制，而不是「每 N 帧」——
+# 帧间隔本来就会抖，按帧数算出来的 Hz 会跟着飘（28.5fps÷2 = 14.3Hz 而不是 15）。
+# 板端实测 kpu≈36ms，所以 AI 频率和帧率此消彼长：
+#   16Hz -> 约 26fps     14Hz -> 约 28fps     11Hz -> 约 34fps
+AI_HZ = int(CFG.get("ai_hz") or 16)
+if AI_HZ < 1:
+    AI_HZ = 1
+elif AI_HZ > 30:
+    AI_HZ = 30
+AI_GAP_MS = max(1, 1000 // AI_HZ)
 
 # 主循环末尾要不要「补齐到固定帧间隔」。
 # 老代码固定补到 gap_for(fps)=33ms，本意是让节奏均匀；
@@ -225,7 +214,7 @@ def detect(kpu, ai2d, arr):
 
 
 def run():
-    global DETECT_EVERY
+    global AI_GAP_MS
     ip = ws.setup_network()
 
     # 拿到 STA 网卡句柄（sta / auto 模式连上热点时才有），用来读 RSSI
@@ -306,11 +295,12 @@ def run():
         return e
 
     # 画质档：手机浏览器访问 /near /mid /far /micro 一键切换
+    # hz = 该档位的识别框刷新频率（链路越差，AI 也让一点路给编码）
     PROFILES = {
-        "near": {"rate": BIT_RATE, "fps": 30, "detect": DETECT_EVERY},
-        "mid": {"rate": max(800, BIT_RATE // 2), "fps": 20, "detect": max(DETECT_EVERY, 3)},
-        "far": {"rate": LOW_RATE, "fps": 15, "detect": max(DETECT_EVERY, 4)},
-        "micro": {"rate": max(200, LOW_RATE // 2), "fps": 10, "detect": max(DETECT_EVERY, 5)},
+        "near": {"rate": BIT_RATE, "fps": 30, "hz": AI_HZ},
+        "mid": {"rate": max(800, BIT_RATE // 2), "fps": 20, "hz": 12},
+        "far": {"rate": LOW_RATE, "fps": 15, "hz": 9},
+        "micro": {"rate": max(200, LOW_RATE // 2), "fps": 10, "hz": 7},
     }
     cur_fps_cap = int(CFG.get("fps") or 25)
     cur_rate = BIT_RATE
@@ -334,6 +324,7 @@ def run():
         feed_gap_ms = 0
     last_feed_ms = 0
     last_show_ms = 0
+    next_ai_ms = 0         # 下一次该跑识别的时刻（累加式节拍，锁住设定 Hz）
     t_reap = time.ticks_ms()
 
     # RGB565 -> YUV420SP，把画好框的帧转给编码器，这样推流画面带识别框
@@ -359,8 +350,8 @@ def run():
     sen.run()
     server.start()
     print("图传地址: http://%s:%d/" % (ip, ws.HTTP_PORT))
-    print("编码: h264 %dx%d %d kbit/s, 检测: %dx%d(每 %d 帧), 模型: %s" %
-          (W, H, BIT_RATE, W, H, DETECT_EVERY, KMODEL))
+    print("编码: h264 %dx%d %d kbit/s, 检测: %dx%d(识别 %dHz), 模型: %s" %
+          (W, H, BIT_RATE, W, H, AI_HZ, KMODEL))
     ws._self_check(ip, ws.HTTP_PORT)
 
     wd_state = {"stop": False}
@@ -526,9 +517,20 @@ def run():
                 print("会话就绪：已请求 IDR")
 
             gate += 1
-            # AI 每 DETECT_EVERY 帧跑一次，其余帧复用上次结果重画，避免拖慢帧率
+            # 按「时间节拍」跑识别：用一个累加的截止时间，而不是 now+间隔。
+            # 因为判断只发生在每轮循环，now+间隔 会被量化成循环周期的整数倍
+            # （62ms 的间隔 + 20ms 的轮 -> 实际每 80ms 才跑一次，只有 12.5Hz）。
+            # 累加截止时间可以自然「补拍」，长期平均才真的是设定的 Hz。
             _t1 = time.ticks_ms()
-            if detect_on and (gate % DETECT_EVERY == 1 or not targets_ready):
+            _ai_due = (next_ai_ms == 0 or time.ticks_diff(_t1, next_ai_ms) >= 0)
+            if detect_on and (not targets_ready or _ai_due):
+                if next_ai_ms == 0:
+                    next_ai_ms = time.ticks_add(_t1, AI_GAP_MS)
+                else:
+                    next_ai_ms = time.ticks_add(next_ai_ms, AI_GAP_MS)
+                    # 落后超过一个周期就别追了（避免连续补拍把帧率压死）
+                    if time.ticks_diff(_t1, next_ai_ms) > AI_GAP_MS:
+                        next_ai_ms = time.ticks_add(_t1, AI_GAP_MS)
                 gated += 1
                 # 2) AI 通道
                 arr = sen.snapshot(chn=CAM_CHN_ID_2).to_numpy_ref()
@@ -737,13 +739,13 @@ def run():
                 server.requested_profile = None
                 _p = PROFILES.get(_pf)
                 if _p is not None:
-                    print("画质档: %s (码率 %d, 帧率上限 %d, 检测每 %d 帧)" %
-                          (_pf, _p["rate"], _p["fps"], _p["detect"]))
+                    print("画质档: %s (码率 %d, 帧率上限 %d, 识别 %.0fHz)" %
+                          (_pf, _p["rate"], _p["fps"], _p["hz"]))
                     cur_rate = _p["rate"]
                     cur_fps_cap = _p["fps"]
                     frame_gap_ms = gap_for(cur_fps_cap)
                     feed_gap_ms = 0        # 同主初始化：每轮都喂，别被量化掉一半
-                    DETECT_EVERY = _clamp_detect(_p["detect"])
+                    AI_GAP_MS = max(1, 1000 // int(_p["hz"]))
                     server.current_profile = _pf
                     server.current_rate = cur_rate
                     enc = swap_encoder(enc, cur_rate, cur_fps_cap)
